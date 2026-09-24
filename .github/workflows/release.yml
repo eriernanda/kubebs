@@ -9,38 +9,8 @@ on:
       - 'v*'
 
 jobs:
-  validate:
-    name: Validate Windows build
-    runs-on: windows-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install JavaScript dependencies
-        run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Build frontend
-        run: npm run build:frontend
-
-      - name: Check Rust code
-        run: cargo check --manifest-path src-tauri/Cargo.toml
-
-  release:
-    name: Build and publish Windows installer
-    needs: validate
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+  windows:
+    name: Validate or release Windows build
     runs-on: windows-latest
     permissions:
       contents: write
@@ -60,14 +30,34 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
-      - name: Build and publish release
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: Kubebs ${{ github.ref_name }}
-          releaseBody: Download the Kubebs Windows installer below.
-          releaseDraft: false
-          prerelease: false
+          workspaces: src-tauri -> target
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Validate frontend and Rust
+        if: github.ref_type != 'tag'
+        run: |
+          npm run build:frontend
+          cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Build Windows installer
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: tauri-apps/tauri-action@v0
+        with:
           args: --bundles nsis
+
+      - name: Create release and upload installer
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Kubebs ${{ github.ref_name }}
+          body: Download the Kubebs Windows installer below.
+          draft: false
+          prerelease: false
+          files: src-tauri/target/release/bundle/nsis/*-setup.exe
+          fail_on_unmatched_files: true
