@@ -45,5 +45,5 @@ pub fn run() {
             commands::cancel_resource_watch
         ])
         .run(tauri::generate_context!())
-        .expect("Infra failed to start");
+        .expect("Kubebs failed to start");
 }

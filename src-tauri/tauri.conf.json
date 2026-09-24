@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Infra",
+  "productName": "Kubebs",
   "version": "0.2.0",
   "identifier": "dev.infra.kubernetes",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Infra",
+        "title": "Kubebs",
         "width": 1100,
         "height": 720,
         "minWidth": 920,

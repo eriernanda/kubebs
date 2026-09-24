@@ -962,7 +962,7 @@ export default function App() {
       <header className="app-titlebar" data-tauri-drag-region>
         <div className="titlebar-brand" data-tauri-drag-region>
           <span className="brand-mark" aria-hidden="true"><Activity size={15} strokeWidth={2.2} /></span>
-          <span>Infra</span>
+          <span>Kubebs</span>
         </div>
         <div className="titlebar-breadcrumbs">
           <span>{section === "overview" ? "Overview" : section === "network" ? "Network" : section === "cluster" ? "Nodes" : "Workloads"}</span>
@@ -1251,7 +1251,7 @@ function ConnectionScreen({
         <h1>{loading ? contexts.length ? "Connecting to cluster" : "Loading kubeconfig" : noContexts ? "Open a kubeconfig file" : "Choose a context"}</h1>
         <p className="connection-description">
           {loading ? contexts.length ? `Connecting to ${selected}…` : "Reading kubeconfig…" : error?.message ?? (noContexts
-            ? "Choose a kubeconfig file. Infra won't modify it; credentials stay on this device."
+            ? "Choose a kubeconfig file. Kubebs won't modify it; credentials stay on this device."
             : "Choose a context. Credentials stay on this device.")}
         </p>
         {!noContexts && <span className="field-label">Kubernetes context</span>}
@@ -2281,7 +2281,7 @@ function ShellTerminal({ selection, relatedPods, pod, sessionId, error, onError,
       void navigator.clipboard.readText().then((text) => {
         if (sessionRef.current === session && text) instance.paste(text);
       }).catch(() => {
-        instance.writeln("\r\nClipboard paste failed. Check clipboard access for Infra.");
+        instance.writeln("\r\nClipboard paste failed. Check clipboard access for Kubebs.");
       });
       return false;
     });

@@ -151,7 +151,7 @@ function assertDesktopRuntime(): void {
   if (!("__TAURI_INTERNALS__" in window)) {
     throw {
       kind: "not_connected",
-      message: "Run Infra as a desktop app to read your local kubeconfig.",
+      message: "Run Kubebs as a desktop app to read your local kubeconfig.",
     } satisfies InfraError;
   }
 }

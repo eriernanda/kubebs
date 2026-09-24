@@ -1,12 +1,12 @@
 [package]
-name = "infra"
+name = "kubebs"
 version = "0.2.0"
 description = "A focused Kubernetes desktop client"
-authors = ["Infra"]
+authors = ["Kubebs"]
 edition = "2021"
 
 [lib]
-name = "infra_lib"
+name = "kubebs_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

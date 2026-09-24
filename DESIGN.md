@@ -1,8 +1,8 @@
-# Infra design direction
+# Kubebs design direction
 
 ## Product read
 
-Infra is a Windows-first Kubernetes desktop client for operators investigating cluster health. Its primary job is to take an operator from a workload that needs attention to the resource details and evidence behind its state.
+Kubebs is a Windows-first Kubernetes desktop client for operators investigating cluster health. Its primary job is to take an operator from a workload that needs attention to the resource details and evidence behind its state.
 
 **Reading:** Native-feeling Windows utility for Kubernetes operators, using Windows 11 Fluent interaction conventions with restrained, spacious desktop composition. ENERGY 1 / RHYTHM 2 / MOTION 1.
 
@@ -38,7 +38,7 @@ In CSS, express theme-dependent references with semantic variables and `light-da
 The persistent workspace has an inset navigation island, one integrated title/action strip, and a main investigation surface. The title strip carries the app identity, current section/resource breadcrumb, cluster actions and window controls in a single row, with no rule separating it from the workspace. The sidebar keeps its island shape in both expanded and collapsed states; collapse turns it into an icon rail with a top-anchored icon-only toggle and tooltips. The resource detail pane is also inset as an island, including expanded and narrow layouts. Revision history shows an exact local date and time, including seconds and the local timezone, and hides revisions whose full container image set matches the current deployment. Restart and restore use an in-app, keyboard-dismissable confirmation dialog. Keep resource browsing table-first; selected-resource details remain a contextual pane. On the overview, give the investigation queue the strongest content hierarchy, with deployment status as supporting context and summary values subordinate.
 
 ```text
-┌ Integrated title/actions · Infra · section/resource · window controls┐
+┌ Integrated title/actions · Kubebs · section/resource · window controls┐
 │ Context / navigation │ Cluster context and actual connection state  │
 │                      ├───────────────────────────────────────────────┤
 │ Overview             │                                               │
@@ -63,6 +63,6 @@ The persistent workspace has an inset navigation island, one integrated title/ac
 
 - A single integrated title/action strip makes window chrome and workspace controls read as one desktop surface; custom caption controls are needed because the window is undecorated.
 - Segoe UI Variable is chosen for Windows familiarity and legibility; Cascadia Code is limited to technical strings because exact character alignment helps scan and copy them.
-- The workload investigation queue is the signature because it expresses Infra's actual operator task rather than borrowing a generic dashboard motif.
+- The workload investigation queue is the signature because it expresses Kubebs' actual operator task rather than borrowing a generic dashboard motif.
 - Gold carries the product's identity and its selected/focus states; semantic colors carry actual cluster and metric meaning.
 - RHYTHM 2 preserves predictable navigation and tables while allowing the overview to give the investigation queue a distinct composition.
