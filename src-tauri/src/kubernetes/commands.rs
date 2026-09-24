@@ -1,14 +1,14 @@
-use std::{collections::BTreeMap, fs, path::PathBuf, sync::atomic::Ordering, time::Duration};
+use std::{collections::BTreeMap, fs, path::PathBuf, sync::{atomic::Ordering, Arc}, time::Duration};
 
-use futures::{AsyncBufReadExt, StreamExt, TryStreamExt};
+use futures::{AsyncBufReadExt, SinkExt, StreamExt, TryStreamExt};
 use k8s_openapi::api::{
-    apps::v1::{Deployment, StatefulSet},
-    core::v1::{Event, Namespace, Pod, Service},
+    apps::v1::{Deployment, ReplicaSet, StatefulSet},
+    core::v1::{Event, Namespace, Node, Pod, Service},
     networking::v1::Ingress,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
-    api::{Api, ListParams, LogParams, ResourceExt},
+    api::{Api, AttachParams, ListParams, LogParams, Patch, PatchParams, ResourceExt, TerminalSize},
     config::{KubeConfigOptions, Kubeconfig},
     runtime::{watcher, WatchStreamExt},
     Client,
@@ -124,6 +124,16 @@ pub struct ContainerSummary {
     pub ready: bool,
     pub restart_count: i32,
     pub state_reason: Option<String>,
+    pub resources: ContainerResourceSummary,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerResourceSummary {
+    pub cpu_request: Option<String>,
+    pub cpu_limit: Option<String>,
+    pub memory_request: Option<String>,
+    pub memory_limit: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -151,6 +161,7 @@ pub struct DeploymentSummary {
     pub available: i32,
     pub updated: i32,
     pub image: Option<String>,
+    pub images: Vec<String>,
     pub created_at: Option<String>,
     pub selector: BTreeMap<String, String>,
 }
@@ -211,6 +222,118 @@ pub struct EventSummary {
 pub struct LogLine {
     pub stream_id: String,
     pub line: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeSummary {
+    pub name: String,
+    pub ready: bool,
+    pub version: String,
+    pub capacity_cpu: Option<String>,
+    pub capacity_memory: Option<String>,
+    pub allocatable_cpu: Option<String>,
+    pub allocatable_memory: Option<String>,
+    pub conditions: Vec<NodeCondition>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeCondition {
+    pub condition_type: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RolloutRevision {
+    pub revision: i64,
+    pub created_at: Option<String>,
+    pub images: Vec<String>,
+    pub template: serde_json::Value,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceMetric {
+    pub name: String,
+    pub namespace: Option<String>,
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellOutput { pub session_id: String, pub text: String, pub closed: bool }
+
+#[tauri::command]
+pub async fn open_pod_shell(session_id: String, name: String, namespace: String, container: String, cols: u16, rows: u16, channel: Channel<ShellOutput>, state: State<'_, KubernetesState>) -> Result<(), AppError> {
+    let active = active(&state).await?;
+    let api: Api<Pod> = Api::namespaced(active.client, &namespace);
+    let params = AttachParams { container: Some(container), stdin: true, stdout: true, stderr: false, tty: true, ..Default::default() };
+    let mut process = api.exec(&name, ["/bin/sh", "-i"], &params).await.map_err(|error| {
+        let mut app_error = AppError::from_kube(&error);
+        app_error.message = format!("Pod exec request failed: {error:?}");
+        app_error
+    })?;
+    let mut stdin = process.stdin().ok_or_else(|| AppError { kind: ErrorKind::Api, message: "The container shell did not provide input.".into() })?;
+    let mut stdout = process.stdout().ok_or_else(|| AppError { kind: ErrorKind::Api, message: "The container shell did not provide output.".into() })?;
+    let mut terminal_size = process.terminal_size().ok_or_else(|| AppError { kind: ErrorKind::Api, message: "The container shell does not support terminal resizing.".into() })?;
+    terminal_size.send(TerminalSize { width: cols.max(1), height: rows.max(1) }).await.map_err(|error| AppError { kind: ErrorKind::Connection, message: format!("Unable to set the initial terminal size: {error}") })?;
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<String>(64);
+    let (resize_sender, mut resize_receiver) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
+    let shell_inputs = Arc::clone(&state.shell_inputs);
+    let shell_resizes = Arc::clone(&state.shell_resizes);
+    shell_inputs.lock().unwrap_or_else(|p| p.into_inner()).insert(session_id.clone(), sender);
+    shell_resizes.lock().unwrap_or_else(|p| p.into_inner()).insert(session_id.clone(), resize_sender);
+    let id = session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let _process = process;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buffer = [0u8; 4096];
+        loop {
+            tokio::select! {
+                input = receiver.recv() => match input {
+                    Some(input) => if stdin.write_all(input.as_bytes()).await.is_err() { break; },
+                    None => break,
+                },
+                size = resize_receiver.recv() => match size {
+                    Some((width, height)) => if terminal_size.send(TerminalSize { width: width.max(1), height: height.max(1) }).await.is_err() { break; },
+                    None => break,
+                },
+                read = stdout.read(&mut buffer) => match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => if channel.send(ShellOutput { session_id: id.clone(), text: String::from_utf8_lossy(&buffer[..count]).into_owned(), closed: false }).is_err() { break; },
+                }
+            }
+        }
+        shell_inputs.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+        shell_resizes.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+        let _ = channel.send(ShellOutput { session_id: id, text: String::new(), closed: true });
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn send_pod_shell_input(session_id: String, input: String, state: State<'_, KubernetesState>) -> Result<(), AppError> {
+    let sender = state.shell_inputs.lock().unwrap_or_else(|p| p.into_inner()).get(&session_id).cloned().ok_or_else(|| AppError { kind: ErrorKind::NotFound, message: "The shell session is no longer connected.".into() })?;
+    sender.send(input).await.map_err(|_| AppError { kind: ErrorKind::Connection, message: "The shell session has ended.".into() })
+}
+
+#[tauri::command]
+pub async fn close_pod_shell(session_id: String, state: State<'_, KubernetesState>) -> Result<(), AppError> {
+    state.shell_inputs.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
+    state.shell_resizes.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn resize_pod_shell(session_id: String, cols: u16, rows: u16, state: State<'_, KubernetesState>) -> Result<(), AppError> {
+    let sender = state.shell_resizes.lock().unwrap_or_else(|p| p.into_inner()).get(&session_id).cloned().ok_or_else(|| AppError { kind: ErrorKind::NotFound, message: "The shell session is no longer connected.".into() })?;
+    sender.send((cols.max(1), rows.max(1))).await.map_err(|_| AppError { kind: ErrorKind::Connection, message: "The shell session has ended.".into() })
 }
 
 #[derive(Clone, Serialize)]
@@ -289,6 +412,12 @@ fn pod_summary(pod: Pod) -> PodSummary {
                 ready: runtime.is_some_and(|item| item.ready),
                 restart_count: runtime.map_or(0, |item| item.restart_count),
                 state_reason: waiting_reason,
+                resources: ContainerResourceSummary {
+                    cpu_request: container.resources.as_ref().and_then(|resources| resources.requests.as_ref()).and_then(|values| values.get("cpu")).map(|quantity| quantity.0.clone()),
+                    cpu_limit: container.resources.as_ref().and_then(|resources| resources.limits.as_ref()).and_then(|values| values.get("cpu")).map(|quantity| quantity.0.clone()),
+                    memory_request: container.resources.as_ref().and_then(|resources| resources.requests.as_ref()).and_then(|values| values.get("memory")).map(|quantity| quantity.0.clone()),
+                    memory_limit: container.resources.as_ref().and_then(|resources| resources.limits.as_ref()).and_then(|values| values.get("memory")).map(|quantity| quantity.0.clone()),
+                },
             }
         })
         .collect();
@@ -322,12 +451,19 @@ fn deployment_summary(deployment: Deployment) -> DeploymentSummary {
     let namespace = deployment.namespace().unwrap_or_default();
     let spec = deployment.spec.unwrap_or_default();
     let status = deployment.status.unwrap_or_default();
-    let image = spec.template.spec.and_then(|template| {
-        template
-            .containers
-            .first()
-            .and_then(|container| container.image.clone())
-    });
+    let images: Vec<String> = spec
+        .template
+        .spec
+        .as_ref()
+        .map(|template| {
+            template
+                .containers
+                .iter()
+                .filter_map(|container| container.image.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let image = images.first().cloned();
     DeploymentSummary {
         name,
         namespace,
@@ -336,6 +472,7 @@ fn deployment_summary(deployment: Deployment) -> DeploymentSummary {
         available: status.available_replicas.unwrap_or_default(),
         updated: status.updated_replicas.unwrap_or_default(),
         image,
+        images,
         created_at: metadata_time(deployment.metadata.creation_timestamp),
         selector: spec
             .selector
@@ -752,6 +889,145 @@ pub async fn list_ingresses(
     api.list(&ListParams::default()).await
         .map(|list| list.items.into_iter().map(ingress_summary).collect())
         .map_err(|error| AppError::from_kube(&error))
+}
+
+#[tauri::command]
+pub async fn list_nodes(state: State<'_, KubernetesState>) -> Result<Vec<NodeSummary>, AppError> {
+    let active = active(&state).await?;
+    let api: Api<Node> = Api::all(active.client);
+    let list = api.list(&ListParams::default()).await.map_err(|error| AppError::from_kube(&error))?;
+    Ok(list.items.into_iter().map(|node| {
+        let name = node.metadata.name.clone().unwrap_or_default();
+        let created_at = metadata_time(node.metadata.creation_timestamp.clone());
+        let status = node.status.unwrap_or_default();
+        let conditions = status.conditions.clone().unwrap_or_default().into_iter().map(|condition| NodeCondition {
+            condition_type: condition.type_,
+            status: condition.status,
+            reason: condition.reason,
+            message: condition.message,
+        }).collect::<Vec<_>>();
+        let ready = status.conditions.unwrap_or_default().iter().any(|condition| condition.type_ == "Ready" && condition.status == "True");
+        let capacity = status.capacity.unwrap_or_default();
+        let allocatable = status.allocatable.unwrap_or_default();
+        NodeSummary {
+            name, ready,
+            version: status.node_info.map(|info| info.kubelet_version).unwrap_or_default(),
+            capacity_cpu: capacity.get("cpu").map(|quantity| quantity.0.clone()),
+            capacity_memory: capacity.get("memory").map(|quantity| quantity.0.clone()),
+            allocatable_cpu: allocatable.get("cpu").map(|quantity| quantity.0.clone()),
+            allocatable_memory: allocatable.get("memory").map(|quantity| quantity.0.clone()),
+            conditions,
+            created_at,
+        }
+    }).collect())
+}
+
+fn metrics_api(client: Client, namespace: Option<&str>, kind: &str, plural: &str) -> Api<kube::core::DynamicObject> {
+    use kube::discovery::ApiResource;
+    let resource = ApiResource { group: "metrics.k8s.io".into(), version: "v1beta1".into(), api_version: "metrics.k8s.io/v1beta1".into(), kind: kind.into(), plural: plural.into() };
+    match namespace { Some(ns) => Api::namespaced_with(client, ns, &resource), None => Api::all_with(client, &resource) }
+}
+
+#[tauri::command]
+pub async fn list_pod_metrics(namespace: Option<String>, state: State<'_, KubernetesState>) -> Result<Vec<ResourceMetric>, AppError> {
+    let active = active(&state).await?;
+    let list = metrics_api(active.client, namespace.as_deref(), "PodMetrics", "pods").list(&ListParams::default()).await.map_err(|error| AppError::from_kube(&error))?;
+    Ok(list.items.into_iter().map(|item| {
+        let containers = item.data.get("containers").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+        let mut cpu_nanos = 0u128;
+        let mut memory_bytes = 0u128;
+        let mut has_cpu = false;
+        let mut has_memory = false;
+        for container in containers {
+            if let Some(usage) = container.get("usage") {
+                if let Some(value) = usage.get("cpu").and_then(serde_json::Value::as_str) { cpu_nanos += parse_cpu_nanos(value); has_cpu = true; }
+                if let Some(value) = usage.get("memory").and_then(serde_json::Value::as_str) { memory_bytes += parse_memory_bytes(value); has_memory = true; }
+            }
+        }
+        ResourceMetric { name: item.metadata.name.unwrap_or_default(), namespace: item.metadata.namespace, cpu: has_cpu.then(|| format_cpu(cpu_nanos)), memory: has_memory.then(|| format_memory(memory_bytes)) }
+    }).collect())
+}
+
+#[tauri::command]
+pub async fn list_node_metrics(state: State<'_, KubernetesState>) -> Result<Vec<ResourceMetric>, AppError> {
+    let active = active(&state).await?;
+    let list = metrics_api(active.client, None, "NodeMetrics", "nodes").list(&ListParams::default()).await.map_err(|error| AppError::from_kube(&error))?;
+    Ok(list.items.into_iter().map(|item| {
+        let usage = item.data.get("usage");
+        ResourceMetric { name: item.metadata.name.unwrap_or_default(), namespace: None,
+            cpu: usage.and_then(|u| u.get("cpu")).and_then(serde_json::Value::as_str).map(|value| format_cpu(parse_cpu_nanos(value))),
+            memory: usage.and_then(|u| u.get("memory")).and_then(serde_json::Value::as_str).map(|value| format_memory(parse_memory_bytes(value))) }
+    }).collect())
+}
+
+fn parse_cpu_nanos(value: &str) -> u128 {
+    let (number, scale) = if let Some(number) = value.strip_suffix('n') { (number, 1.0) }
+    else if let Some(number) = value.strip_suffix('u') { (number, 1_000.0) }
+    else if let Some(number) = value.strip_suffix('m') { (number, 1_000_000.0) }
+    else { (value, 1_000_000_000.0) };
+    number.parse::<f64>().map(|amount| (amount * scale) as u128).unwrap_or(0)
+}
+
+fn parse_memory_bytes(value: &str) -> u128 {
+    let units = [("Ei", 1u128 << 60), ("Pi", 1u128 << 50), ("Ti", 1u128 << 40), ("Gi", 1u128 << 30), ("Mi", 1u128 << 20), ("Ki", 1u128 << 10), ("E", 1_000_000_000_000_000_000), ("P", 1_000_000_000_000_000), ("T", 1_000_000_000_000), ("G", 1_000_000_000), ("M", 1_000_000), ("k", 1_000)];
+    for (unit, multiplier) in units { if let Some(number) = value.strip_suffix(unit) { return number.parse::<f64>().map(|amount| (amount * multiplier as f64) as u128).unwrap_or(0); } }
+    value.parse::<f64>().map(|amount| amount as u128).unwrap_or(0)
+}
+
+fn format_cpu(nanos: u128) -> String {
+    format!("{:.2}m", nanos as f64 / 1_000_000.0)
+}
+
+fn format_memory(bytes: u128) -> String {
+    const GIB: u128 = 1 << 30;
+    const MIB: u128 = 1 << 20;
+    if bytes >= GIB { format!("{:.2}Gi", bytes as f64 / GIB as f64) }
+    else if bytes >= MIB { format!("{:.2}Mi", bytes as f64 / MIB as f64) }
+    else { format!("{:.2}Ki", bytes as f64 / 1024.0) }
+}
+
+#[tauri::command]
+pub async fn restart_deployment(name: String, namespace: String, state: State<'_, KubernetesState>) -> Result<(), AppError> {
+    let active = active(&state).await?;
+    let api: Api<Deployment> = Api::namespaced(active.client, &namespace);
+    let timestamp = chrono_placeholder_now();
+    api.patch(&name, &PatchParams::default(), &Patch::Merge(serde_json::json!({"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":timestamp}}}}}))).await.map_err(|error| AppError::from_kube(&error))?;
+    Ok(())
+}
+
+fn chrono_placeholder_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+#[tauri::command]
+pub async fn list_rollout_revisions(name: String, namespace: String, state: State<'_, KubernetesState>) -> Result<Vec<RolloutRevision>, AppError> {
+    let active = active(&state).await?;
+    let deployments: Api<Deployment> = Api::namespaced(active.client.clone(), &namespace);
+    let deployment = deployments.get(&name).await.map_err(|error| AppError::from_kube(&error))?;
+    let uid = deployment.metadata.uid.clone().unwrap_or_default();
+    let replicasets: Api<ReplicaSet> = Api::namespaced(active.client, &namespace);
+    let list = replicasets.list(&ListParams::default()).await.map_err(|error| AppError::from_kube(&error))?;
+    let mut revisions: Vec<_> = list.items.into_iter().filter(|rs| rs.metadata.owner_references.as_ref().is_some_and(|owners| owners.iter().any(|owner| owner.uid == uid && owner.kind == "Deployment"))).filter_map(|rs| {
+        let revision = rs.metadata.annotations.as_ref()?.get("deployment.kubernetes.io/revision")?.parse::<i64>().ok()?;
+        let template = serde_json::to_value(rs.spec?.template).ok()?;
+        let images = template.pointer("/spec/containers").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|container| container.get("image").and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
+        Some(RolloutRevision { revision, created_at: metadata_time(rs.metadata.creation_timestamp), images, template })
+    }).collect();
+    revisions.sort_by_key(|item| item.revision);
+    Ok(revisions)
+}
+
+#[tauri::command]
+pub async fn restore_deployment_revision(name: String, namespace: String, revision: i64, state: State<'_, KubernetesState>) -> Result<(), AppError> {
+    let active = active(&state).await?;
+    let deployments: Api<Deployment> = Api::namespaced(active.client.clone(), &namespace);
+    let deployment = deployments.get(&name).await.map_err(|error| AppError::from_kube(&error))?;
+    let uid = deployment.metadata.uid.clone().unwrap_or_default();
+    let replicasets: Api<ReplicaSet> = Api::namespaced(active.client, &namespace);
+    let list = replicasets.list(&ListParams::default()).await.map_err(|error| AppError::from_kube(&error))?;
+    let template = list.items.into_iter().find(|rs| rs.metadata.owner_references.as_ref().is_some_and(|owners| owners.iter().any(|owner| owner.uid == uid && owner.kind == "Deployment")) && rs.metadata.annotations.as_ref().and_then(|a| a.get("deployment.kubernetes.io/revision")).and_then(|v| v.parse::<i64>().ok()) == Some(revision)).and_then(|rs| rs.spec.map(|spec| spec.template)).ok_or_else(|| AppError { kind: ErrorKind::NotFound, message: "That rollout revision is no longer retained by Kubernetes.".into() })?;
+    deployments.patch(&name, &PatchParams::default(), &Patch::Merge(serde_json::json!({"spec":{"template":template}}))).await.map_err(|error| AppError::from_kube(&error))?;
+    Ok(())
 }
 
 #[tauri::command]

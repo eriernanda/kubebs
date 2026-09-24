@@ -3,7 +3,7 @@ pub mod commands;
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{atomic::AtomicU64, Mutex},
+    sync::{atomic::AtomicU64, Arc, Mutex},
 };
 
 use kube::Client;
@@ -24,5 +24,7 @@ pub struct KubernetesState {
     pub kubeconfig_path: RwLock<Option<PathBuf>>,
     pub log_streams: Mutex<HashMap<String, CancellationToken>>,
     pub resource_watches: Mutex<HashMap<String, CancellationToken>>,
+    pub shell_inputs: Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+    pub shell_resizes: Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<(u16, u16)>>>>,
     pub connection_generation: AtomicU64,
 }

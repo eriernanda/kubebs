@@ -1,6 +1,6 @@
 [package]
 name = "infra"
-version = "0.1.0"
+version = "0.2.0"
 description = "A focused Kubernetes desktop client"
 authors = ["Infra"]
 edition = "2021"
@@ -13,6 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+chrono = { version = "0.4", features = ["clock"] }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 kube = { version = "4.2", features = ["client", "config", "runtime", "rustls-tls", "ws"] }
 serde = { version = "1", features = ["derive"] }
