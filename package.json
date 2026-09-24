@@ -9,7 +9,8 @@
     "build:frontend": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "cargo:clean": "cargo clean --manifest-path .\\src-tauri\\Cargo.toml"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
