@@ -222,6 +222,7 @@ pub struct EventSummary {
 pub struct LogLine {
     pub stream_id: String,
     pub line: String,
+    pub connected: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -267,52 +268,145 @@ pub struct ResourceMetric {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ShellOutput { pub session_id: String, pub text: String, pub closed: bool }
+pub struct ShellOutput {
+    pub session_id: String,
+    pub bytes: Vec<u8>,
+    pub closed: bool,
+    pub failed: bool,
+    pub reason: Option<String>,
+    pub exit_code: Option<i32>,
+}
+
+struct ShellRegistration {
+    id: String,
+    sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, CancellationToken>>>,
+    inputs: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+    resizes: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<(u16, u16)>>>>,
+}
+
+struct ShellProcess(kube::api::AttachedProcess);
+impl Drop for ShellProcess {
+    fn drop(&mut self) { self.0.abort(); }
+}
+
+impl ShellRegistration {
+    fn register(state: &KubernetesState, id: String, token: CancellationToken) -> Result<Self, AppError> {
+        let mut sessions = state.shell_sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if sessions.contains_key(&id) {
+            return Err(AppError { kind: ErrorKind::Api, message: "Duplicate shell session.".into() });
+        }
+        sessions.insert(id.clone(), token);
+        Ok(Self { id, sessions: Arc::clone(&state.shell_sessions), inputs: Arc::clone(&state.shell_inputs), resizes: Arc::clone(&state.shell_resizes) })
+    }
+}
+
+async fn await_shell_setup<T>(token: &CancellationToken, deadline: tokio::time::Instant, setup: impl std::future::Future<Output = Result<T, AppError>>) -> Result<T, AppError> {
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => Err(AppError { kind: ErrorKind::Connection, message: "Shell connection cancelled.".into() }),
+        result = tokio::time::timeout_at(deadline, setup) => result.map_err(|_| AppError { kind: ErrorKind::Connection, message: "Shell connection timed out after 30 seconds.".into() })?,
+    }
+}
+
+impl Drop for ShellRegistration {
+    fn drop(&mut self) {
+        if let Some(token) = self.sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.id) { token.cancel(); }
+        self.inputs.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.id);
+        self.resizes.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.id);
+    }
+}
+
+fn cancel_shells(state: &KubernetesState) {
+    let mut sessions = state.shell_sessions.lock().unwrap_or_else(|p| p.into_inner());
+    for token in sessions.values() { token.cancel(); }
+    sessions.clear();
+    state.shell_inputs.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    state.shell_resizes.lock().unwrap_or_else(|p| p.into_inner()).clear();
+}
 
 #[tauri::command]
-pub async fn open_pod_shell(session_id: String, name: String, namespace: String, container: String, cols: u16, rows: u16, channel: Channel<ShellOutput>, state: State<'_, KubernetesState>) -> Result<(), AppError> {
+pub async fn open_pod_shell(session_id: String, name: String, namespace: String, container: String, cols: u16, rows: u16, expected_context: String, channel: Channel<ShellOutput>, state: State<'_, KubernetesState>) -> Result<(), AppError> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let generation = state.connection_generation.load(Ordering::SeqCst);
+    let token = CancellationToken::new();
+    let registration = ShellRegistration::register(&state, session_id.clone(), token.clone())?;
     let active = active(&state).await?;
+    if active.context != expected_context { return Err(AppError::disconnected()); }
+    if token.is_cancelled() || generation != state.connection_generation.load(Ordering::SeqCst) { return Err(AppError::disconnected()); }
     let api: Api<Pod> = Api::namespaced(active.client, &namespace);
     let params = AttachParams { container: Some(container), stdin: true, stdout: true, stderr: false, tty: true, ..Default::default() };
-    let mut process = api.exec(&name, ["/bin/sh", "-i"], &params).await.map_err(|error| {
+    let process = await_shell_setup(&token, deadline, async {
+      api.exec(&name, ["/bin/sh", "-i"], &params).await.map_err(|error| {
         let mut app_error = AppError::from_kube(&error);
         app_error.message = format!("Pod exec request failed: {error:?}");
         app_error
-    })?;
-    let mut stdin = process.stdin().ok_or_else(|| AppError { kind: ErrorKind::Api, message: "The container shell did not provide input.".into() })?;
-    let mut stdout = process.stdout().ok_or_else(|| AppError { kind: ErrorKind::Api, message: "The container shell did not provide output.".into() })?;
-    let mut terminal_size = process.terminal_size().ok_or_else(|| AppError { kind: ErrorKind::Api, message: "The container shell does not support terminal resizing.".into() })?;
-    terminal_size.send(TerminalSize { width: cols.max(1), height: rows.max(1) }).await.map_err(|error| AppError { kind: ErrorKind::Connection, message: format!("Unable to set the initial terminal size: {error}") })?;
+      })
+    }).await?;
+    let mut process = ShellProcess(process);
+    if token.is_cancelled() || generation != state.connection_generation.load(Ordering::SeqCst) { return Err(AppError::disconnected()); }
+    let mut stdin = process.0.stdin().ok_or_else(|| AppError { kind: ErrorKind::Api, message: "The container shell did not provide input.".into() })?;
+    let mut stdout = process.0.stdout().ok_or_else(|| AppError { kind: ErrorKind::Api, message: "The container shell did not provide output.".into() })?;
+    let mut terminal_size = process.0.terminal_size().ok_or_else(|| AppError { kind: ErrorKind::Api, message: "The container shell does not support terminal resizing.".into() })?;
+    await_shell_setup(&token, deadline, async {
+        terminal_size.send(TerminalSize { width: cols.max(1), height: rows.max(1) }).await.map_err(|error| AppError { kind: ErrorKind::Connection, message: format!("Unable to set the initial terminal size: {error}") })
+    }).await?;
+    if token.is_cancelled() || generation != state.connection_generation.load(Ordering::SeqCst) { return Err(AppError::disconnected()); }
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<String>(64);
     let (resize_sender, mut resize_receiver) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
-    let shell_inputs = Arc::clone(&state.shell_inputs);
-    let shell_resizes = Arc::clone(&state.shell_resizes);
-    shell_inputs.lock().unwrap_or_else(|p| p.into_inner()).insert(session_id.clone(), sender);
-    shell_resizes.lock().unwrap_or_else(|p| p.into_inner()).insert(session_id.clone(), resize_sender);
+    registration.inputs.lock().unwrap_or_else(|p| p.into_inner()).insert(session_id.clone(), sender);
+    registration.resizes.lock().unwrap_or_else(|p| p.into_inner()).insert(session_id.clone(), resize_sender);
     let id = session_id.clone();
     tauri::async_runtime::spawn(async move {
+        let _registration = registration;
+        let status = process.0.take_status();
         let _process = process;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut buffer = [0u8; 4096];
+        let mut reason = "Remote shell ended".to_string();
+        let mut failed = false;
         loop {
             tokio::select! {
+                biased;
+                _ = token.cancelled() => { reason = "Cancelled".into(); break; },
                 input = receiver.recv() => match input {
-                    Some(input) => if stdin.write_all(input.as_bytes()).await.is_err() { break; },
+                    Some(input) => {
+                        let result = tokio::select! { biased; _ = token.cancelled() => break, result = stdin.write_all(input.as_bytes()) => result };
+                        if let Err(error) = result { failed = true; reason = format!("Shell input failed: {error}"); break; }
+                    },
                     None => break,
                 },
                 size = resize_receiver.recv() => match size {
-                    Some((width, height)) => if terminal_size.send(TerminalSize { width: width.max(1), height: height.max(1) }).await.is_err() { break; },
+                    Some((width, height)) => {
+                        let result = tokio::select! { biased; _ = token.cancelled() => break, result = terminal_size.send(TerminalSize { width: width.max(1), height: height.max(1) }) => result };
+                        if let Err(error) = result { failed = true; reason = format!("Shell resize failed: {error}"); break; }
+                    },
                     None => break,
                 },
                 read = stdout.read(&mut buffer) => match read {
-                    Ok(0) | Err(_) => break,
-                    Ok(count) => if channel.send(ShellOutput { session_id: id.clone(), text: String::from_utf8_lossy(&buffer[..count]).into_owned(), closed: false }).is_err() { break; },
+                    Ok(0) => break,
+                    Err(error) => { failed = true; reason = format!("Shell output failed: {error}"); break; },
+                    Ok(count) => if channel.send(ShellOutput { session_id: id.clone(), bytes: buffer[..count].to_vec(), closed: false, failed: false, reason: None, exit_code: None }).is_err() { break; },
                 }
             }
         }
-        shell_inputs.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
-        shell_resizes.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
-        let _ = channel.send(ShellOutput { session_id: id, text: String::new(), closed: true });
+        let mut exit_code = None;
+        if reason == "Remote shell ended" {
+            if let Some(status) = status {
+                let result = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => None,
+                    result = tokio::time::timeout(std::time::Duration::from_secs(2), status) => result.ok().flatten(),
+                };
+                if let Some(status) = result {
+                    failed = status.status.as_deref() != Some("Success");
+                    exit_code = status.details.as_ref().and_then(|details| details.causes.as_ref()).and_then(|causes| causes.iter().find(|cause| cause.reason.as_deref() == Some("ExitCode"))).and_then(|cause| cause.message.as_ref()).and_then(|code| code.parse().ok());
+                    if status.status.as_deref() == Some("Success") { exit_code = Some(0); }
+                    reason = if status.status.as_deref() == Some("Failure") { format!("Shell failed: {}", status.message.unwrap_or_else(|| "Remote command failed".into())) } else { "Shell exited".into() };
+                } else { failed = true; reason = "Shell connection failed: no termination status received".into(); }
+            } else { failed = true; reason = "Shell connection failed: termination status unavailable".into(); }
+        }
+        if token.is_cancelled() { failed = false; reason = "Cancelled".into(); }
+        let _ = channel.send(ShellOutput { session_id: id, bytes: Vec::new(), closed: true, failed, reason: Some(reason), exit_code });
     });
     Ok(())
 }
@@ -325,6 +419,7 @@ pub async fn send_pod_shell_input(session_id: String, input: String, state: Stat
 
 #[tauri::command]
 pub async fn close_pod_shell(session_id: String, state: State<'_, KubernetesState>) -> Result<(), AppError> {
+    if let Some(token) = state.shell_sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&session_id) { token.cancel(); }
     state.shell_inputs.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
     state.shell_resizes.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
     Ok(())
@@ -667,6 +762,7 @@ pub async fn load_kubeconfig(
     fs::write(&saved_file, path.to_string_lossy().as_bytes()).map_err(|_| AppError::config())?;
 
     state.connection_generation.fetch_add(1, Ordering::SeqCst);
+    cancel_shells(&state);
     *state.active.write().await = None;
     cancel_resource_watches(&state);
     {
@@ -690,6 +786,7 @@ pub async fn connect_context(
     state: State<'_, KubernetesState>,
 ) -> Result<ConnectionInfo, AppError> {
     let generation = state.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    cancel_shells(&state);
     *state.active.write().await = None;
     cancel_resource_watches(&state);
     {
@@ -759,6 +856,7 @@ pub async fn connect_context(
 #[tauri::command]
 pub async fn disconnect(state: State<'_, KubernetesState>) -> Result<(), AppError> {
     state.connection_generation.fetch_add(1, Ordering::SeqCst);
+    cancel_shells(&state);
     *state.active.write().await = None;
     cancel_resource_watches(&state);
     let mut streams = state
@@ -987,8 +1085,9 @@ fn format_memory(bytes: u128) -> String {
 }
 
 #[tauri::command]
-pub async fn restart_deployment(name: String, namespace: String, state: State<'_, KubernetesState>) -> Result<(), AppError> {
+pub async fn restart_deployment(name: String, namespace: String, expected_context: String, state: State<'_, KubernetesState>) -> Result<(), AppError> {
     let active = active(&state).await?;
+    if active.context != expected_context { return Err(AppError::disconnected()); }
     let api: Api<Deployment> = Api::namespaced(active.client, &namespace);
     let timestamp = chrono_placeholder_now();
     api.patch(&name, &PatchParams::default(), &Patch::Merge(serde_json::json!({"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":timestamp}}}}}))).await.map_err(|error| AppError::from_kube(&error))?;
@@ -1018,14 +1117,17 @@ pub async fn list_rollout_revisions(name: String, namespace: String, state: Stat
 }
 
 #[tauri::command]
-pub async fn restore_deployment_revision(name: String, namespace: String, revision: i64, state: State<'_, KubernetesState>) -> Result<(), AppError> {
+pub async fn restore_deployment_revision(name: String, namespace: String, revision: i64, expected_context: String, state: State<'_, KubernetesState>) -> Result<(), AppError> {
+    let generation = state.connection_generation.load(Ordering::SeqCst);
     let active = active(&state).await?;
+    if active.context != expected_context { return Err(AppError::disconnected()); }
     let deployments: Api<Deployment> = Api::namespaced(active.client.clone(), &namespace);
     let deployment = deployments.get(&name).await.map_err(|error| AppError::from_kube(&error))?;
     let uid = deployment.metadata.uid.clone().unwrap_or_default();
     let replicasets: Api<ReplicaSet> = Api::namespaced(active.client, &namespace);
     let list = replicasets.list(&ListParams::default()).await.map_err(|error| AppError::from_kube(&error))?;
     let template = list.items.into_iter().find(|rs| rs.metadata.owner_references.as_ref().is_some_and(|owners| owners.iter().any(|owner| owner.uid == uid && owner.kind == "Deployment")) && rs.metadata.annotations.as_ref().and_then(|a| a.get("deployment.kubernetes.io/revision")).and_then(|v| v.parse::<i64>().ok()) == Some(revision)).and_then(|rs| rs.spec.map(|spec| spec.template)).ok_or_else(|| AppError { kind: ErrorKind::NotFound, message: "That rollout revision is no longer retained by Kubernetes.".into() })?;
+    if generation != state.connection_generation.load(Ordering::SeqCst) { return Err(AppError::disconnected()); }
     deployments.patch(&name, &PatchParams::default(), &Patch::Merge(serde_json::json!({"spec":{"template":template}}))).await.map_err(|error| AppError::from_kube(&error))?;
     Ok(())
 }
@@ -1414,13 +1516,18 @@ pub async fn stream_pod_logs(
         ..Default::default()
     };
     let result = async {
-        let reader = api.log_stream(&name, &params).await.map_err(|error| AppError::from_kube(&error))?;
+        let reader = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            result = api.log_stream(&name, &params) => result.map_err(|error| AppError::from_kube(&error))?,
+        };
+        channel.send(LogLine { stream_id: stream_id.clone(), line: String::new(), connected: true }).map_err(|_| AppError { kind: ErrorKind::Api, message: "The log view closed.".into() })?;
         let mut lines = Box::pin(reader.lines());
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => break,
                 line = lines.try_next() => match line {
-                    Ok(Some(line)) => channel.send(LogLine { stream_id: stream_id.clone(), line }).map_err(|_| AppError { kind: ErrorKind::Api, message: "The log view closed.".into() })?,
+                    Ok(Some(line)) => channel.send(LogLine { stream_id: stream_id.clone(), line, connected: false }).map_err(|_| AppError { kind: ErrorKind::Api, message: "The log view closed.".into() })?,
                     Ok(None) => break,
                     Err(_error) => return Err(AppError { kind: ErrorKind::Connection, message: "The log stream ended unexpectedly.".into() }),
                 }
@@ -1450,4 +1557,71 @@ pub async fn cancel_log_stream(
         token.cancel();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn setup_timeout_and_cancellation_are_bounded() {
+        let token = CancellationToken::new();
+        let error = await_shell_setup::<()>(&token, tokio::time::Instant::now(), std::future::pending()).await.unwrap_err();
+        assert!(error.message.contains("timed out"));
+        token.cancel();
+        let error = await_shell_setup(&token, tokio::time::Instant::now() + std::time::Duration::from_secs(30), async { Ok(()) }).await.unwrap_err();
+        assert!(error.message.contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn cluster_change_cancels_pending_shell_setup() {
+        let state = KubernetesState::default();
+        let token = CancellationToken::new();
+        let registration = ShellRegistration::register(&state, "pending".into(), token.clone()).unwrap();
+        cancel_shells(&state);
+        tokio::time::timeout(std::time::Duration::from_millis(100), token.cancelled()).await.unwrap();
+        assert!(state.shell_sessions.lock().unwrap().is_empty());
+        drop(registration);
+    }
+
+    #[test]
+    fn failed_setup_cleans_registration_and_input_channels() {
+        let state = KubernetesState::default();
+        let token = CancellationToken::new();
+        let registration = ShellRegistration::register(&state, "failed".into(), token.clone()).unwrap();
+        let (input, _) = tokio::sync::mpsc::channel(1);
+        let (resize, _) = tokio::sync::mpsc::channel(1);
+        state.shell_inputs.lock().unwrap().insert("failed".into(), input);
+        state.shell_resizes.lock().unwrap().insert("failed".into(), resize);
+        drop(registration);
+        assert!(token.is_cancelled());
+        assert!(state.shell_sessions.lock().unwrap().is_empty());
+        assert!(state.shell_inputs.lock().unwrap().is_empty());
+        assert!(state.shell_resizes.lock().unwrap().is_empty());
+        cancel_shells(&state);
+        cancel_shells(&state);
+    }
+
+    #[test]
+    fn duplicate_session_does_not_replace_original_cancellation() {
+        let state = KubernetesState::default();
+        let first = CancellationToken::new();
+        let _registration = ShellRegistration::register(&state, "same".into(), first.clone()).unwrap();
+        assert!(ShellRegistration::register(&state, "same".into(), CancellationToken::new()).is_err());
+        cancel_shells(&state);
+        assert!(first.is_cancelled());
+    }
+
+    #[test]
+    fn closing_one_session_preserves_other_registrations() {
+        let state = KubernetesState::default();
+        let first = CancellationToken::new();
+        let second = CancellationToken::new();
+        let registration = ShellRegistration::register(&state, "one".into(), first.clone()).unwrap();
+        let _other = ShellRegistration::register(&state, "two".into(), second.clone()).unwrap();
+        drop(registration);
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        assert_eq!(state.shell_sessions.lock().unwrap().len(), 1);
+    }
 }

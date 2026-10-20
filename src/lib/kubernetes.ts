@@ -113,6 +113,7 @@ export interface EventSummary {
 export interface LogLine {
   streamId: string;
   line: string;
+  connected: boolean;
 }
 
 export interface NodeSummary {
@@ -129,7 +130,7 @@ export interface NodeSummary {
 
 export interface ResourceMetric { name: string; namespace?: string; cpu?: string; memory?: string }
 export interface RolloutRevision { revision: number; createdAt?: string; images: string[]; template: unknown }
-export interface ShellOutput { sessionId: string; text: string; closed: boolean }
+export interface ShellOutput { sessionId: string; bytes: number[]; closed: boolean; failed?: boolean; reason?: string; exitCode?: number }
 
 export type ResourceKind = "pod" | "deployment" | "statefulset" | "service" | "ingress" | "event";
 export type ResourceSummary = PodSummary | DeploymentSummary | StatefulSetSummary | ServiceSummary | IngressSummary | EventSummary;
@@ -184,9 +185,9 @@ export const kubernetes = {
   nodes: () => command<NodeSummary[]>("list_nodes"),
   podMetrics: (namespace: string | null) => command<ResourceMetric[]>("list_pod_metrics", { namespace }),
   nodeMetrics: () => command<ResourceMetric[]>("list_node_metrics"),
-  restartDeployment: (name: string, namespace: string) => command<void>("restart_deployment", { name, namespace }),
+  restartDeployment: (name: string, namespace: string, expectedContext: string) => command<void>("restart_deployment", { name, namespace, expectedContext }),
   rolloutRevisions: (name: string, namespace: string) => command<RolloutRevision[]>("list_rollout_revisions", { name, namespace }),
-  restoreDeploymentRevision: (name: string, namespace: string, revision: number) => command<void>("restore_deployment_revision", { name, namespace, revision }),
+  restoreDeploymentRevision: (name: string, namespace: string, revision: number, expectedContext: string) => command<void>("restore_deployment_revision", { name, namespace, revision, expectedContext }),
   pods: (namespace: string | null) => command<PodSummary[]>("list_pods", { namespace }),
   deployments: (namespace: string | null) => command<DeploymentSummary[]>("list_deployments", { namespace }),
   statefulSets: (namespace: string | null) => command<StatefulSetSummary[]>("list_stateful_sets", { namespace }),
@@ -209,20 +210,22 @@ export const kubernetes = {
     namespace: string,
     container: string | undefined,
     onLine: (line: string) => void,
+    onConnected?: () => void,
   ) => {
     assertDesktopRuntime();
     const channel = new Channel<LogLine>();
     channel.onmessage = (message) => {
-      if (message.streamId === streamId) onLine(message.line);
+      if (message.streamId !== streamId) return;
+      if (message.connected) onConnected?.(); else onLine(message.line);
     };
     return command<void>("stream_pod_logs", { streamId, name, namespace, container, channel });
   },
   cancelLogStream: (streamId: string) => command<void>("cancel_log_stream", { streamId }),
-  openShell: async (sessionId: string, name: string, namespace: string, container: string, cols: number, rows: number, onOutput: (output: ShellOutput) => void) => {
+  openShell: async (sessionId: string, name: string, namespace: string, container: string, cols: number, rows: number, onOutput: (output: ShellOutput) => void, expectedContext?: string) => {
     assertDesktopRuntime();
     const channel = new Channel<ShellOutput>();
     channel.onmessage = (message) => { if (message.sessionId === sessionId) onOutput(message); };
-    return command<void>("open_pod_shell", { sessionId, name, namespace, container, cols, rows, channel });
+    return command<void>("open_pod_shell", { sessionId, name, namespace, container, cols, rows, channel, expectedContext });
   },
   sendShellInput: (sessionId: string, input: string) => command<void>("send_pod_shell_input", { sessionId, input }),
   resizeShell: (sessionId: string, cols: number, rows: number) => command<void>("resize_pod_shell", { sessionId, cols, rows }),

@@ -1,6 +1,6 @@
 [package]
 name = "kubebs"
-version = "0.2.1"
+version = "0.2.2"
 description = "A focused Kubernetes desktop client"
 authors = ["Kubebs"]
 edition = "2021"

@@ -30,8 +30,9 @@ import {
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
+import { PersistentShell } from "./components/ShellWorkspace";
+import { ShellWorkspace, ShellWorkspaceContext, resourceKey } from "./lib/shell-workspace";
+import { navigateTabs, restoreResourceFocus } from "./lib/tab-navigation";
 import "@xterm/xterm/css/xterm.css";
 import {
   errorFrom,
@@ -50,7 +51,6 @@ import {
   type ResourceSummary,
   type ResourceWatchMessage,
   type RolloutRevision,
-  type ShellOutput,
   type NodeSummary,
   type ResourceMetric,
 } from "./lib/kubernetes";
@@ -62,7 +62,7 @@ type Selection = { kind: Kind; name: string; namespace: string };
 type ResourceTab = { key: string; selection: Selection; detailTab: DetailTab };
 type LoadState = "loading" | "ready" | "error";
 type WatchStatus = "live" | "reconnecting" | "stale" | "polling";
-type RolloutConfirmation = { action: "restart" } | { action: "restore"; revision: number };
+type RolloutConfirmation = ({ action: "restart" } | { action: "restore"; revision: number }) & { context: ConnectionInfo; target: Selection; generation: number };
 
 const LAST_NAMESPACE_PREFIX = "infra.namespace.";
 
@@ -94,10 +94,6 @@ function eventsNewestFirst(items: EventSummary[]): EventSummary[] {
     const rightTime = Date.parse(right.lastSeen ?? "") || 0;
     return rightTime - leftTime;
   });
-}
-
-function resourceKey(selection: Selection): string {
-  return `${selection.kind}:${selection.namespace}/${selection.name}`;
 }
 
 function revisionUsesCurrentImages(revision: RolloutRevision, currentImages: string[]): boolean {
@@ -170,6 +166,7 @@ export default function App() {
   const [logSearch, setLogSearch] = useState("");
   const [showLogTimestamps, setShowLogTimestamps] = useState(false);
   const [logPaused, setLogPaused] = useState(false);
+  const [logStatus, setLogStatus] = useState("Idle");
   const [loadState, setLoadState] = useState<LoadState>("ready");
   const [detailState, setDetailState] = useState<LoadState>("loading");
   const [error, setError] = useState<InfraError | null>(null);
@@ -205,27 +202,30 @@ export default function App() {
   const [podMetricsUnavailable, setPodMetricsUnavailable] = useState(false);
   const [resourcePodMetrics, setResourcePodMetrics] = useState<ResourceMetric[]>([]);
   const [resourceMetricsUnavailable, setResourceMetricsUnavailable] = useState(false);
-  const [shellSession, setShellSession] = useState<string | null>(null);
-  const [shellError, setShellError] = useState<InfraError | null>(null);
-  const [shellPod, setShellPod] = useState("");
-  const [shellContainer, setShellContainer] = useState("");
-  const reportShellError = useCallback((cause: unknown) => setShellError(errorFrom(cause)), []);
+  const shellWorkspace = useMemo(() => new ShellWorkspace(activeContext?.context), [activeContext]);
+  useEffect(() => () => shellWorkspace.clear(), [shellWorkspace]);
+  useEffect(() => shellWorkspace.retain(resourceTabs.map((tab) => resourceKey(tab.selection))), [shellWorkspace, resourceTabs]);
   const requestId = useRef(0);
+  const viewGeneration = useRef(0);
+  const refreshGeneration = useRef(0);
+  useLayoutEffect(() => {
+    viewGeneration.current += 1;
+    setRolloutConfirmation(null);
+    setRolloutBusy(false);
+    setRolloutError(null);
+  }, [activeContext, namespace, selection]);
   const detailRequestId = useRef(0);
   const watchSubscription = useRef<string | null>(null);
   const eventSubscription = useRef<string | null>(null);
   const selectedRef = useRef<Selection | null>(null);
   const renderedSelectionRef = useRef<Selection | null>(null);
   const logStreamId = useRef<string | null>(null);
-  const shellSessionRef = useRef<string | null>(null);
   const rolloutDialog = useRef<HTMLDialogElement>(null);
-  const shellWriteRef = useRef<((text: string) => void) | null>(null);
   const loadedDetailKey = useRef<string | null>(null);
   const logPane = useRef<HTMLDivElement>(null);
   const contextMenu = useRef<HTMLDivElement>(null);
   const detailResize = useRef<{ pointerId: number } | null>(null);
   selectedRef.current = selection;
-  shellSessionRef.current = shellSession;
 
   useEffect(() => {
     if (sidebarCollapsed) setContextMenuOpen(false);
@@ -242,7 +242,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const disableNativeContextMenu = (event: MouseEvent) => event.preventDefault();
+    const disableNativeContextMenu = (event: MouseEvent) => {
+      if (event.target instanceof Element && event.target.closest(".shell-terminal-host")) return;
+      event.preventDefault();
+    };
     document.addEventListener("contextmenu", disableNativeContextMenu);
     return () => document.removeEventListener("contextmenu", disableNativeContextMenu);
   }, []);
@@ -269,24 +272,6 @@ export default function App() {
     }
     return () => { window.cancelAnimationFrame(frame); window.clearTimeout(timer); };
   }, [selection]);
-
-  useEffect(() => {
-    if (!shellSession) return;
-    return () => { void kubernetes.closeShell(shellSession).catch(() => undefined); };
-  }, [selection, shellSession]);
-
-  const startPodShell = async (podName: string, container: string, cols: number, rows: number) => {
-    if (!selection || !container) return;
-    if (shellSession) await kubernetes.closeShell(shellSession).catch(() => undefined);
-    const sessionId = crypto.randomUUID();
-    setShellError(null); setShellSession(sessionId); setShellPod(podName); setShellContainer(container);
-    try {
-      await kubernetes.openShell(sessionId, podName, selection.namespace, container, cols, rows, (message: ShellOutput) => {
-        if (message.closed) { setShellSession(null); return; }
-        shellWriteRef.current?.(message.text);
-      });
-    } catch (cause) { setShellError(errorFrom(cause)); setShellSession(null); }
-  };
 
   const loadLists = useCallback(async (activeNamespace: string, request: number) => {
     setLoadState("loading");
@@ -741,30 +726,33 @@ export default function App() {
 
   const restartDeployment = () => {
     if (!selection || selection.kind !== "deployment" || !activeContext) return;
-    setRolloutConfirmation({ action: "restart" });
+    setRolloutConfirmation({ action: "restart", target: selection, context: activeContext, generation: viewGeneration.current });
   };
 
   const restoreRollout = (revision: number) => {
     if (!selection || selection.kind !== "deployment" || !activeContext) return;
-    setRolloutConfirmation({ action: "restore", revision });
+    setRolloutConfirmation({ action: "restore", revision, target: selection, context: activeContext, generation: viewGeneration.current });
   };
 
   const confirmRolloutAction = async () => {
     const confirmation = rolloutConfirmation;
     if (!selection || selection.kind !== "deployment" || !activeContext || !confirmation) return;
-    const target = selection;
+    if (confirmation.generation !== viewGeneration.current || confirmation.context !== activeContext) { setRolloutConfirmation(null); return; }
+    const target = confirmation.target;
+    const current = () => confirmation.generation === viewGeneration.current;
     setRolloutConfirmation(null);
     setRolloutBusy(true);
     try {
       if (confirmation.action === "restart") {
-        await kubernetes.restartDeployment(target.name, target.namespace);
+        await kubernetes.restartDeployment(target.name, target.namespace, confirmation.context.context);
       } else {
-        await kubernetes.restoreDeploymentRevision(target.name, target.namespace, confirmation.revision);
+        await kubernetes.restoreDeploymentRevision(target.name, target.namespace, confirmation.revision, confirmation.context.context);
       }
-      setRolloutRevisions(await kubernetes.rolloutRevisions(target.name, target.namespace));
-      refresh();
-    } catch (cause) { setRolloutError(errorFrom(cause)); }
-    finally { setRolloutBusy(false); }
+      if (!current()) return;
+      const revisions = await kubernetes.rolloutRevisions(target.name, target.namespace);
+      if (current()) { setRolloutRevisions(revisions); refresh(); }
+    } catch (cause) { if (current()) setRolloutError(errorFrom(cause)); }
+    finally { if (current()) setRolloutBusy(false); }
   };
 
   useEffect(() => {
@@ -790,12 +778,6 @@ export default function App() {
 
   useLayoutEffect(() => {
     setLogs([]);
-    setShellPod("");
-    setShellContainer("");
-    if (shellSessionRef.current) {
-      void kubernetes.closeShell(shellSessionRef.current).catch(() => undefined);
-      setShellSession(null);
-    }
     if (selection) {
       setLogPodName("");
       setLogContainer("");
@@ -828,13 +810,16 @@ export default function App() {
     if (!logTargetName || !logTargetNamespace) return;
     const streamId = crypto.randomUUID();
     logStreamId.current = streamId;
+    setLogStatus("Connecting");
     void kubernetes.streamLogs(streamId, logTargetName, logTargetNamespace, logContainer || undefined, (line) => {
       if (logStreamId.current !== streamId) return;
       setLogs((existing) => [...existing.slice(-1199), line]);
-    }).catch((cause) => {
+    }, () => { if (logStreamId.current === streamId) setLogStatus("Live"); }).catch((cause) => {
+      if (logStreamId.current !== streamId) return;
       setDetailError(errorFrom(cause));
+      setLogStatus("Error");
     }).finally(() => {
-      if (logStreamId.current === streamId) logStreamId.current = null;
+      if (logStreamId.current === streamId) { logStreamId.current = null; setLogStatus((status) => status === "Error" ? status : "Ended"); }
     });
     return () => {
       if (logStreamId.current === streamId) logStreamId.current = null;
@@ -842,21 +827,23 @@ export default function App() {
     };
   }, [detailState, detailTab, logContainer, logPaused, logTargetName, logTargetNamespace, selection]);
 
-  useLayoutEffect(() => {
-    if (logPane.current) logPane.current.scrollTop = logPane.current.scrollHeight;
-  }, [detailTab, logs, logContainer, logPodName, selection]);
-
   const problemPods = useMemo(() => pods.filter((pod) => !podHealthy(pod)), [pods]);
   const unhealthyDeployments = useMemo(() => deployments.filter((item) => !deploymentHealthy(item)), [deployments]);
   const refresh = () => {
     if (!activeContext) return;
+    const view = viewGeneration.current;
+    const refreshId = ++refreshGeneration.current;
+    const current = () => view === viewGeneration.current && refreshId === refreshGeneration.current;
     void loadLists(namespace, ++requestId.current);
-    void kubernetes.nodes().then(setNodes).catch((cause) => setNodesError(errorFrom(cause)));
+    void kubernetes.nodes().then((items) => { if (current()) { setNodes(items); setNodesError(null); } }).catch((cause) => { if (current()) setNodesError(errorFrom(cause)); });
     Promise.allSettled([kubernetes.nodeMetrics(), kubernetes.podMetrics(namespace === "all" ? null : namespace)]).then(([nodeResult, podResult]) => {
-      if (nodeResult.status === "fulfilled") setNodeMetrics(nodeResult.value); else setNodeMetricsUnavailable(true);
-      if (podResult.status === "fulfilled") setPodMetrics(podResult.value); else setPodMetricsUnavailable(true);
+      if (!current()) return;
+      setNodeMetricsUnavailable(nodeResult.status !== "fulfilled");
+      setPodMetricsUnavailable(podResult.status !== "fulfilled");
+      if (nodeResult.status === "fulfilled") setNodeMetrics(nodeResult.value);
+      if (podResult.status === "fulfilled") setPodMetrics(podResult.value);
     });
-    if (selection && ["pod", "deployment"].includes(selection.kind)) void kubernetes.podMetrics(selection.namespace).then((items) => { setResourcePodMetrics(items); setResourceMetricsUnavailable(false); }).catch(() => setResourceMetricsUnavailable(true));
+    if (selection && ["pod", "deployment"].includes(selection.kind)) void kubernetes.podMetrics(selection.namespace).then((items) => { if (current()) { setResourcePodMetrics(items); setResourceMetricsUnavailable(false); } }).catch(() => { if (current()) setResourceMetricsUnavailable(true); });
   };
 
   const chooseNamespace = (nextNamespace: string) => {
@@ -896,6 +883,7 @@ export default function App() {
     const fallback = next.at(-1);
     setSelection(fallback?.selection ?? null);
     setDetailTab(fallback?.detailTab ?? "summary");
+    restoreResourceFocus();
   };
 
   const copyText = async (value: string) => {
@@ -1097,7 +1085,7 @@ export default function App() {
                   allHealthy={allHealthy}
                   liveState={liveState}
                 />
-              ) : section === "cluster" ? <NodeView nodes={nodes} nodesError={nodesError} onRetryNodes={() => { setNodesLoading(true); void kubernetes.nodes().then((items) => { setNodes(items); setNodesError(null); }).catch((cause) => { setNodesError(errorFrom(cause)); }).finally(() => setNodesLoading(false)); }} nodeMetrics={nodeMetrics} podMetrics={podMetrics} namespace={namespace} nodeMetricsUnavailable={nodeMetricsUnavailable} podMetricsUnavailable={podMetricsUnavailable} loading={nodesLoading} /> : (
+              ) : section === "cluster" ? <NodeView nodes={nodes} nodesError={nodesError} onRetryNodes={refresh} nodeMetrics={nodeMetrics} podMetrics={podMetrics} namespace={namespace} nodeMetricsUnavailable={nodeMetricsUnavailable} podMetricsUnavailable={podMetricsUnavailable} loading={nodesLoading} /> : (
                 <Workloads
                   key={section}
                   section={section}
@@ -1120,7 +1108,7 @@ export default function App() {
               )}
             </div>
             {renderedSelection && (
-              <DetailPanel
+              <ShellWorkspaceContext.Provider value={shellWorkspace}><DetailPanel
                 selection={renderedSelection}
                 resourceTabs={resourceTabs}
                 activeResourceKey={resourceKey(renderedSelection)}
@@ -1129,6 +1117,7 @@ export default function App() {
                   const index = resourceTabs.findIndex((item) => item.key === resourceTab.key);
                   const next = resourceTabs.filter((item) => item.key !== resourceTab.key);
                   setResourceTabs(next);
+                  restoreResourceFocus();
                   if (resourceKey(renderedSelection) === resourceTab.key) {
                     const fallback = next[Math.min(index, next.length - 1)];
                     setSelection(fallback?.selection ?? null);
@@ -1160,6 +1149,7 @@ export default function App() {
                 showLogTimestamps={showLogTimestamps}
                 setShowLogTimestamps={setShowLogTimestamps}
                 paused={logPaused}
+                logStatus={logStatus}
                 logPane={logPane}
                 copied={copied}
                 rolloutRevisions={rolloutRevisions}
@@ -1167,20 +1157,8 @@ export default function App() {
                 rolloutBusy={rolloutBusy}
                 onRestartDeployment={() => void restartDeployment()}
                 onRestoreRevision={(revision) => void restoreRollout(revision)}
-                shellSession={shellSession}
-                shellError={shellError}
-                onShellError={reportShellError}
-                shellPod={shellPod}
-                shellContainer={shellContainer}
                 resourcePodMetrics={resourcePodMetrics}
                 resourceMetricsUnavailable={resourceMetricsUnavailable}
-                setShellPod={setShellPod}
-                setShellContainer={setShellContainer}
-                shellWriteRef={shellWriteRef}
-                onStartShell={(podName, container, cols, rows) => {
-                  if (podName && container) void startPodShell(podName, container, cols, rows);
-                }}
-                onCloseShell={() => { if (shellSession) void kubernetes.closeShell(shellSession); setShellSession(null); }}
                 width={panelOpen ? detailWidth : 0}
                 expanded={panelOpen && detailExpanded}
                 closing={!panelOpen}
@@ -1193,7 +1171,7 @@ export default function App() {
                 onResource={openResource}
                 onCopy={copyText}
                 onToggleLogs={switchLogStream}
-              />
+              /></ShellWorkspaceContext.Provider>
             )}
           </div>
         </section>
@@ -1209,9 +1187,9 @@ export default function App() {
           <h2 id="rollout-confirm-title">{rolloutConfirmation.action === "restart" ? "Restart deployment rollout?" : `Restore revision ${rolloutConfirmation.revision}?`}</h2>
           <p>{rolloutConfirmation.action === "restart" ? "Kubernetes will restart the deployment's Pods." : "The deployment's Pod template will be changed to this retained revision."}</p>
           <dl>
-            <div><dt>Cluster</dt><dd>{activeContext.context}</dd></div>
-            <div><dt>Namespace</dt><dd>{selection.namespace}</dd></div>
-            <div><dt>Deployment</dt><dd>{selection.name}</dd></div>
+            <div><dt>Cluster</dt><dd>{rolloutConfirmation.context.context}</dd></div>
+            <div><dt>Namespace</dt><dd>{rolloutConfirmation.target.namespace}</dd></div>
+            <div><dt>Deployment</dt><dd>{rolloutConfirmation.target.name}</dd></div>
           </dl>
           <div className="rollout-confirm-actions">
             <button className="dialog-cancel" type="button" onClick={() => setRolloutConfirmation(null)}>Cancel</button>
@@ -1885,6 +1863,7 @@ function DetailPanel({
   showLogTimestamps,
   setShowLogTimestamps,
   paused,
+  logStatus,
   logPane,
   copied,
   rolloutRevisions,
@@ -1892,16 +1871,6 @@ function DetailPanel({
   rolloutBusy,
   onRestartDeployment,
   onRestoreRevision,
-  shellSession,
-  shellError,
-  onShellError,
-  shellPod,
-  shellContainer,
-  setShellPod,
-  setShellContainer,
-  shellWriteRef,
-  onStartShell,
-  onCloseShell,
   resourcePodMetrics,
   resourceMetricsUnavailable,
   onClose,
@@ -1947,6 +1916,7 @@ function DetailPanel({
   showLogTimestamps: boolean;
   setShowLogTimestamps: Dispatch<SetStateAction<boolean>>;
   paused: boolean;
+  logStatus: string;
   logPane: RefObject<HTMLDivElement | null>;
   copied: boolean;
   rolloutRevisions: RolloutRevision[];
@@ -1954,16 +1924,6 @@ function DetailPanel({
   rolloutBusy: boolean;
   onRestartDeployment: () => void;
   onRestoreRevision: (revision: number) => void;
-  shellSession: string | null;
-  shellError: InfraError | null;
-  onShellError: (cause: unknown) => void;
-  shellPod: string;
-  shellContainer: string;
-  setShellPod: (value: string) => void;
-  setShellContainer: (value: string) => void;
-  shellWriteRef: RefObject<((text: string) => void) | null>;
-  onStartShell: (podName: string, container: string, cols: number, rows: number) => void;
-  onCloseShell: () => void;
   resourcePodMetrics: ResourceMetric[];
   resourceMetricsUnavailable: boolean;
   onClose: () => void;
@@ -2022,9 +1982,9 @@ function DetailPanel({
         onPointerCancel={onResizeEnd}
         onKeyDown={onResizeKeyDown}
       />}
-      {resourceTabs.length > 0 && <div className="resource-tab-strip detail-resource-tabs" role="tablist" aria-label="Open resources">
+      {resourceTabs.length > 0 && <div className="resource-tab-strip detail-resource-tabs" role="tablist" aria-label="Open resources" onKeyDown={navigateTabs}>
         {resourceTabs.map((resourceTab) => <div className={`resource-tab ${resourceTab.key === activeResourceKey ? "resource-tab-active" : ""}`} key={resourceTab.key}>
-          <button role="tab" aria-selected={resourceTab.key === activeResourceKey} onClick={() => onSelectResourceTab(resourceTab)} title={`${resourceTab.selection.kind} ${resourceTab.selection.namespace}/${resourceTab.selection.name}`}>
+          <button role="tab" tabIndex={resourceTab.key === activeResourceKey ? 0 : -1} aria-selected={resourceTab.key === activeResourceKey} onClick={() => onSelectResourceTab(resourceTab)} title={`${resourceTab.selection.kind} ${resourceTab.selection.namespace}/${resourceTab.selection.name}`}>
             <span>{resourceTab.selection.kind}</span><strong>{resourceTab.selection.name}</strong>
           </button>
           <button className="resource-tab-close" aria-label={`Close ${resourceTab.selection.name}`} onClick={() => onCloseResourceTab(resourceTab)}><X size={12} /></button>
@@ -2041,8 +2001,8 @@ function DetailPanel({
         </div>
       </div>
       <div className="detail-meta"><span>{selection.namespace}</span><span className={`detail-status detail-status-${statusClass}`}><span />{detailStatus}</span></div>
-      <div className="detail-tabs" role="tablist" aria-label="Resource details">
-        {tabList.map((item) => <button key={item} role="tab" aria-selected={tab === item} className={tab === item ? "detail-tab selected" : "detail-tab"} onClick={() => setTab(item)}>{item === "pods" ? `Pods${state === "ready" && selection.kind === "deployment" ? ` ${relatedPods.length}` : ""}` : item === "events" ? `Events${state === "ready" ? ` ${count}` : ""}` : item === "yaml" ? "YAML" : item === "logs" ? "Logs" : item === "shell" ? "Shell" : "Overview"}</button>)}
+      <div className="detail-tabs" role="tablist" aria-label="Resource details" onKeyDown={navigateTabs}>
+        {tabList.map((item) => <button key={item} role="tab" tabIndex={tab === item ? 0 : -1} aria-selected={tab === item} className={tab === item ? "detail-tab selected" : "detail-tab"} onClick={() => setTab(item)}>{item === "pods" ? `Pods${state === "ready" && selection.kind === "deployment" ? ` ${relatedPods.length}` : ""}` : item === "events" ? `Events${state === "ready" ? ` ${count}` : ""}` : item === "yaml" ? "YAML" : item === "logs" ? "Logs" : item === "shell" ? "Shell" : "Overview"}</button>)}
       </div>
       <div key={`${selection.kind}/${selection.namespace}/${selection.name}/${tab}`} className={`detail-content ${tab === "logs" ? "detail-content-logs" : ""}`}>
         {state === "loading" ? <LoadingState label={`Loading ${selection.kind} details`} /> : state === "error" ? <InlineError error={error} onRetry={() => onResource(selection.kind, selection.name, selection.namespace)} /> : (
@@ -2121,21 +2081,11 @@ function DetailPanel({
             {tab === "pods" && <RelatedPods pods={relatedPods} error={relatedError} onRetry={() => onResource(selection.kind, selection.name, selection.namespace)} onResource={onResource} />}
             {tab === "events" && <EventList events={events} error={eventsError} onRetry={() => onResource(selection.kind, selection.name, selection.namespace)} />}
             {tab === "yaml" && (yamlError ? <div className="partial-error"><InlineError error={yamlError} onRetry={() => onResource(selection.kind, selection.name, selection.namespace)} /></div> : <YamlView yaml={yaml} copied={copied} onCopy={onCopy} />)}
-            {tab === "logs" && hasLogs && <LogsView key={`${selection.kind}/${selection.namespace}/${selection.name}`} selection={selection} pod={pod} relatedPods={relatedPods} logPodName={logPodName} setLogPodName={setLogPodName} logContainer={logContainer} setLogContainer={setLogContainer} logs={logs} logSearch={logSearch} setLogSearch={setLogSearch} showLogTimestamps={showLogTimestamps} setShowLogTimestamps={setShowLogTimestamps} paused={paused} logPane={logPane} error={error} onToggleLogs={onToggleLogs} />}
-            {tab === "shell" && hasShell && <ShellTerminal
+            {tab === "logs" && hasLogs && <LogsView key={`${selection.kind}/${selection.namespace}/${selection.name}`} selection={selection} pod={pod} relatedPods={relatedPods} logPodName={logPodName} setLogPodName={setLogPodName} logContainer={logContainer} setLogContainer={setLogContainer} logs={logs} logSearch={logSearch} setLogSearch={setLogSearch} showLogTimestamps={showLogTimestamps} setShowLogTimestamps={setShowLogTimestamps} paused={paused} logStatus={logStatus} logPane={logPane} error={error} onToggleLogs={onToggleLogs} />}
+            {tab === "shell" && hasShell && resourceTabs.some((item) => item.key === resourceKey(selection)) && <PersistentShell key={resourceKey(selection)}
               selection={selection}
               relatedPods={relatedPods}
               pod={pod}
-              sessionId={shellSession}
-              error={shellError}
-              onError={onShellError}
-              selectedPod={shellPod}
-              selectedContainer={shellContainer}
-              setSelectedPod={(name) => { setShellPod(name); setShellContainer(""); }}
-              setSelectedContainer={setShellContainer}
-              writeRef={shellWriteRef}
-              onConnect={onStartShell}
-              onDisconnect={onCloseShell}
             />}
           </>
         )}
@@ -2205,127 +2155,6 @@ function PodUsageLine({ metric, resources, unavailable }: { metric?: ResourceMet
     return <span title={title}><b>{label}</b> {text}</span>;
   };
   return <div className="pod-usage-line">{value("CPU", "cpu")}<i>·</i>{value("Mem", "memory")}</div>;
-}
-
-function ShellTerminal({ selection, relatedPods, pod, sessionId, error, onError, selectedPod, selectedContainer, setSelectedPod, setSelectedContainer, writeRef, onConnect, onDisconnect }: {
-  selection: Selection;
-  relatedPods: PodSummary[];
-  pod: PodSummary | null;
-  sessionId: string | null;
-  error: InfraError | null;
-  onError: (cause: unknown) => void;
-  selectedPod: string;
-  selectedContainer: string;
-  setSelectedPod: (name: string) => void;
-  setSelectedContainer: (name: string) => void;
-  writeRef: RefObject<((text: string) => void) | null>;
-  onConnect: (podName: string, container: string, cols: number, rows: number) => void;
-  onDisconnect: () => void;
-}) {
-  const host = useRef<HTMLDivElement>(null);
-  const terminal = useRef<Terminal | null>(null);
-  const fit = useRef<FitAddon | null>(null);
-  const sessionRef = useRef(sessionId);
-  const inputQueue = useRef("");
-  sessionRef.current = sessionId;
-  const targetPodName = selection.kind === "pod" ? selection.name : selectedPod || (relatedPods.length === 1 ? relatedPods[0].name : "");
-  const targetPod = selection.kind === "pod" ? pod : relatedPods.find((item) => item.name === targetPodName);
-  const containers = targetPod?.containers ?? [];
-  const targetContainer = selectedContainer || (containers.length === 1 ? containers[0].name : "");
-
-  useEffect(() => {
-    if (!host.current) return;
-    const instance = new Terminal({
-      cursorBlink: true,
-      convertEol: false,
-      fontSize: 12,
-      fontFamily: '"Cascadia Code", Consolas, monospace',
-      scrollback: 3000,
-      theme: { background: "#0d1110", foreground: "#d7e0dc", cursor: "#d3a96d", selectionBackground: "#46534c" },
-    });
-    const fitAddon = new FitAddon();
-    instance.loadAddon(fitAddon);
-    instance.open(host.current);
-    fitAddon.fit();
-    terminal.current = instance;
-    fit.current = fitAddon;
-    writeRef.current = (text) => instance.write(text);
-    if (!sessionRef.current) instance.write("Select a target above and connect.\r\n");
-
-    let flushTimer: number | undefined;
-    const dataSubscription = instance.onData((data) => {
-      if (!sessionRef.current) return;
-      inputQueue.current += data;
-      if (flushTimer !== undefined) return;
-      flushTimer = window.setTimeout(() => {
-        flushTimer = undefined;
-        const session = sessionRef.current;
-        const input = inputQueue.current;
-        inputQueue.current = "";
-        if (session && input) void kubernetes.sendShellInput(session, input).catch(onError);
-      }, 12);
-    });
-    instance.attachCustomKeyEventHandler((event) => {
-      const isPasteShortcut = event.type === "keydown" && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "v";
-      if (!isPasteShortcut) return true;
-      event.preventDefault();
-      const session = sessionRef.current;
-      if (!session) {
-        instance.writeln("\r\nConnect to a container before pasting.");
-        return false;
-      }
-      if (!navigator.clipboard?.readText) {
-        instance.writeln("\r\nClipboard access is unavailable in this WebView.");
-        return false;
-      }
-      void navigator.clipboard.readText().then((text) => {
-        if (sessionRef.current === session && text) instance.paste(text);
-      }).catch(() => {
-        instance.writeln("\r\nClipboard paste failed. Check clipboard access for Kubebs.");
-      });
-      return false;
-    });
-    const resizeObserver = new ResizeObserver(() => {
-      fitAddon.fit();
-      const session = sessionRef.current;
-      if (session) void kubernetes.resizeShell(session, instance.cols, instance.rows).catch(onError);
-    });
-    resizeObserver.observe(host.current);
-    return () => {
-      resizeObserver.disconnect();
-      dataSubscription.dispose();
-      if (flushTimer !== undefined) window.clearTimeout(flushTimer);
-      inputQueue.current = "";
-      writeRef.current = null;
-      terminal.current = null;
-      fit.current = null;
-      instance.dispose();
-    };
-  }, [onError, writeRef]);
-
-  useEffect(() => {
-    if (sessionId) terminal.current?.focus();
-  }, [sessionId]);
-
-  const connect = () => {
-    const instance = terminal.current;
-    const fitAddon = fit.current;
-    if (!instance || !fitAddon || !targetPodName || !targetContainer) return;
-    fitAddon.fit();
-    onConnect(targetPodName, targetContainer, instance.cols, instance.rows);
-  };
-
-  return <div className="shell-panel">
-    <div className="shell-toolbar">
-      {selection.kind === "deployment" && relatedPods.length > 1 && <select aria-label="Select Pod for shell" value={targetPodName} onChange={(event) => setSelectedPod(event.target.value)}><option value="">Choose Pod</option>{relatedPods.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select>}
-      {containers.length > 1 && <select aria-label="Select container for shell" value={targetContainer} onChange={(event) => setSelectedContainer(event.target.value)}><option value="">Choose container</option>{containers.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select>}
-      <span className="shell-target-label">{targetPodName || "No Pod selected"}{targetContainer ? ` · ${targetContainer}` : ""}</span>
-      {!sessionId ? <button className="small-action" disabled={!targetPodName || !targetContainer} onClick={connect}>Connect</button> : <button className="small-action" onClick={onDisconnect}>Disconnect</button>}
-    </div>
-    {error && <div className="shell-error" role="alert"><strong>Could not open the container shell</strong><span>{error.message}</span></div>}
-    {!targetPodName && selection.kind === "deployment" && relatedPods.length === 0 && <div className="shell-error" role="status">No related Pods are available for this Deployment.</div>}
-    <div className="shell-terminal-host" ref={host} role="application" aria-label="Interactive container terminal" onClick={() => terminal.current?.focus()} />
-  </div>;
 }
 
 function Property({ label, value, tone }: { label: string; value: string; tone?: "warning" }) {
@@ -2400,7 +2229,7 @@ function cleanLogLine(line: string, showKubernetesTimestamp: boolean): string {
   return withoutAnsi.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, "");
 }
 
-function LogsView({
+export function LogsView({
   selection,
   pod,
   relatedPods,
@@ -2414,6 +2243,7 @@ function LogsView({
   showLogTimestamps,
   setShowLogTimestamps,
   paused,
+  logStatus,
   logPane,
   error,
   onToggleLogs,
@@ -2431,12 +2261,18 @@ function LogsView({
   showLogTimestamps: boolean;
   setShowLogTimestamps: Dispatch<SetStateAction<boolean>>;
   paused: boolean;
+  logStatus: string;
   logPane: RefObject<HTMLDivElement | null>;
   error: InfraError | null;
   onToggleLogs: () => void;
 }) {
   const targetPod = selection.kind === "pod" ? pod : relatedPods.find((item) => item.name === logPodName) ?? relatedPods[0];
   const containers = targetPod?.containers ?? [];
+  const [following, setFollowing] = useState(true);
+  useLayoutEffect(() => {
+    if (following && logPane.current) logPane.current.scrollTop = logPane.current.scrollHeight;
+  }, [following, logPane, logs, logSearch]);
+  useEffect(() => setFollowing(true), [logContainer, logPodName]);
   useEffect(() => {
     if (targetPod && !targetPod.containers.some((container) => container.name === logContainer)) {
       setLogContainer(targetPod.containers[0]?.name ?? "");
@@ -2447,16 +2283,17 @@ function LogsView({
   if (!targetPod) return <EmptyState title="No Pod to stream" message="No related Pods." />;
   return <div className="logs-panel">
     <div className="logs-toolbar">
-      <span className="live-label"><span />{paused ? "Paused" : "Live"}</span>
+      <span className={`live-label ${logStatus === "Live" && !paused ? "" : "stream-inactive"}`} role="status"><span />{paused ? "Paused" : logStatus}</span>
       {selection.kind !== "pod" && relatedPods.length > 0 && <DropdownMenu className="log-container-picker log-pod-picker" ariaLabel="Log Pod" value={targetPod.name} options={relatedPods.map((item) => ({ value: item.name, label: item.name }))} onChange={(name) => { setLogPodName(name); setLogContainer(""); }} />}
       {containers.length > 1 && <DropdownMenu className="log-container-picker" ariaLabel="Log container" value={logContainer} options={containers.map((container) => ({ value: container.name, label: container.name }))} onChange={setLogContainer} />}
       <label className="log-search"><Search size={12} /><input value={logSearch} onChange={(event) => setLogSearch(event.target.value)} placeholder="Find in logs" aria-label="Search logs" /></label>
       <button className={`timestamp-toggle ${showLogTimestamps ? "timestamp-active" : ""}`} onClick={() => setShowLogTimestamps((value) => !value)} aria-pressed={showLogTimestamps} title="Toggle Kubernetes timestamps">TS</button>
       <span className="logs-latest-label">Last 300 + live</span>
+      {!following && <button className="small-action" onClick={() => setFollowing(true)}>Follow latest</button>}
       <button className="small-action" onClick={onToggleLogs}>{paused ? <Play size={13} /> : <Pause size={13} />}{paused ? "Resume" : "Pause"}</button>
     </div>
     {error && <InlineError error={error} onRetry={onToggleLogs} />}
-    {logs.length === 0 ? <div className="logs-empty"><LoaderCircle size={16} className="spin" /><span>{paused ? "Stream paused" : `Waiting for ${logContainer || "container"} output`}</span></div> : visibleLines.length === 0 ? <div className="logs-empty"><Search size={15} /><span>No lines match this search.</span></div> : <div className="logs-content" ref={logPane}>{visibleLines.map((line, index) => {
+    {logs.length === 0 ? <div className="logs-empty"><span>{paused ? "Stream paused" : logStatus === "Ended" || logStatus === "Error" ? `Stream ${logStatus.toLowerCase()}` : `Waiting for ${logContainer || "container"} output`}</span></div> : visibleLines.length === 0 ? <div className="logs-empty"><Search size={15} /><span>No lines match this search.</span></div> : <div className="logs-content" ref={logPane} onScroll={(event) => { const node = event.currentTarget; setFollowing(node.scrollHeight - node.scrollTop - node.clientHeight < 24); }}>{visibleLines.map((line, index) => {
       const podPrefix = line.match(/^\[([^\]]+)\](.*)$/);
       return <div className="log-line" key={`${index}-${line}`} title={line}>
         {podPrefix ? <><span className="log-pod-name">[{podPrefix[1]}]</span><span>{podPrefix[2]}</span></> : <span>{line}</span>}

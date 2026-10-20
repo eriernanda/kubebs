@@ -26,5 +26,6 @@ pub struct KubernetesState {
     pub resource_watches: Mutex<HashMap<String, CancellationToken>>,
     pub shell_inputs: Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
     pub shell_resizes: Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<(u16, u16)>>>>,
+    pub shell_sessions: Arc<Mutex<HashMap<String, CancellationToken>>>,
     pub connection_generation: AtomicU64,
 }

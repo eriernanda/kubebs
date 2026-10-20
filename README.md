@@ -4,7 +4,7 @@ A Windows-first Kubernetes desktop client built with Tauri, React, TypeScript, a
 
 ## Development
 
-Install Node.js, Rust, and the Windows C++ build tools required by Tauri. Then run:
+Install Node.js 22.13 or newer, Rust, and the Windows C++ build tools required by Tauri. Then run:
 
 ```powershell
 npm install
@@ -25,5 +25,14 @@ The v0.1 workflow is read-only: inspect Pods and Deployments, trace Deployments 
 
 ```powershell
 npm run lint
-npm run build
+npm test
+npm run build:frontend
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
+
+v0.2.2 preserves shell terminals and their 3,000-line scrollback per resource tab. Switching detail views keeps background output; closing a resource tab or changing cluster cancels its shells. Connections can be cancelled while opening and time out after 30 seconds. Reconnect is explicit and never replays commands.
+
+Select terminal output and press **Ctrl+Shift+C**, click **Copy selection**, or right-click the selection to copy it. **Ctrl+C** still interrupts the remote command. Paste with **Ctrl+V** or **Ctrl+Shift+V**.
+
+Logs report connection and termination state. Scrolling into history suspends following; **Follow latest** resumes it. App panes suppress edge bounce and scroll chaining while keeping normal wheel, touchpad, keyboard, and scrollbar behavior. See [release validation](RELEASE_NOTES.md) for remaining native acceptance checks.
